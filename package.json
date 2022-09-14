@@ -1,0 +1,29 @@
+{
+  "name": "swf-diff",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node dist/test.js",
+    "postinstall": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/itselectroz/swf-diff.git"
+  },
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/itselectroz/swf-diff/issues"
+  },
+  "homepage": "https://github.com/itselectroz/swf-diff#readme",
+  "devDependencies": {
+    "@types/node": "^17.0.25",
+    "typescript": "^4.6.3"
+  },
+  "dependencies": {
+    "abc-disassembler": "github:itselectroz/abc-disassembler",
+    "swf-parser": "github:itselectroz/swf-parser"
+  }
+}
