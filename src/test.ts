@@ -1,6 +1,5 @@
 import {
   AbcFile,
-  ClassInfo,
   InstanceInfo,
   InstructionDisassembler,
   MethodBodyInfo,
@@ -15,7 +14,7 @@ import {
 import { readFileSync } from "fs";
 import { join } from "path";
 import { SWFFile } from "swf-parser";
-import { diff } from "./myers";
+import { calcPatch } from "./myers";
 import { getABCFile } from "./util";
 
 const assets = join(__dirname, "../assets");
@@ -42,67 +41,67 @@ if (!abc || !abc2) {
 const multinames = abc.constant_pool.multiname;
 const multinames2 = abc2.constant_pool.multiname;
 
-const cache: any[] = [];
-function findMultiname(
-  one: boolean,
-  nameIndex: number
-): {
+type XRef = {
   instances: InstanceInfo[];
   instance_traits: TraitsInfo[];
-  class: ClassInfo[];
   class_traits: TraitsInfo[];
-} {
-  if (!!cache[nameIndex * 2 + (one ? 0 : 1)]) {
-    return cache[nameIndex * 2 + (one ? 0 : 1)];
-  }
+  code_references: MethodBodyInfo[];
+};
+type XRefCache = {
+  [key: number]: XRef;
+};
 
-  const file = one ? abc : abc2;
+const xrefCache: XRefCache = [];
+const xrefCache2: XRefCache = [];
+async function buildXRef(file: AbcFile, cache: XRefCache) {
+  const disass = new InstructionDisassembler(file);
 
-  const instance = file.instance;
-  const classList = file.class;
+  await Promise.all(
+    file.constant_pool.multiname.map(async (v, i) => {
+      cache[i] = {
+        instances: [],
+        instance_traits: [],
+        class_traits: [],
+        code_references: [],
+      };
+    })
+  );
 
-  const data = {
-    instances: [] as InstanceInfo[],
-    instance_traits: [] as TraitsInfo[],
-    class: [] as ClassInfo[],
-    class_traits: [] as TraitsInfo[],
-  };
+  await Promise.all([
+    ...file.instance.map(async (v) => {
+      const name = v.name;
+      cache[name - 1].instances.push(v);
 
-  instance.forEach((v) => {
-    if (v.name - 1 === nameIndex) data.instances.push(v);
+      v.trait.forEach((t) => {
+        cache[t.name - 1].instance_traits.push(t);
+      });
+    }),
+    ...file.class.map(async (v) => {
+      v.traits.forEach((t) => {
+        cache[t.name - 1].class_traits.push(t);
+      });
+    }),
+    ...file.method_body.map(async (v) => {
+      const instructions = disass.disassemble(v);
 
-    v.trait
-      .filter((t) => t.name - 1 === nameIndex)
-      .forEach((t) => data.instance_traits.push(t));
-  });
+      instructions.forEach((instruction) => {
+        for (let i = 0; i < instruction.types.length; i++) {
+          const type = instruction.types[i];
+          if (type === "multiname") {
+            const rawIndex = instruction.rawParams[i];
 
-  classList.forEach((v) => {
-    v.traits
-      .filter((t) => t.name - 1 === nameIndex)
-      .forEach((t) => data.class_traits.push(t));
-  });
-
-  cache[nameIndex * 2 + (one ? 0 : 1)] = data;
-
-  return data;
+            cache[rawIndex - 1].code_references.push(v);
+          }
+        }
+      });
+    }),
+  ]);
 }
 
-function compareNames(name: string, name2: string) {
-  const isObfuscated = name.startsWith("_-");
-  const isObfuscated2 = name2.startsWith("_-");
-
-  if (isObfuscated !== isObfuscated2) {
-    return false;
-  }
-
-  if (!isObfuscated && name !== name2) {
-    return false;
-  }
-
-  return true;
+function findMultiname(one: boolean, nameIndex: number): XRef {
+  return (one ? xrefCache : xrefCache2)[nameIndex];
 }
 
-const traitCache: any = {};
 function compareTraits(trait: TraitsInfo, trait2: TraitsInfo) {
   if (trait.kind !== trait2.kind) return false;
 
@@ -155,20 +154,15 @@ function compareTraits(trait: TraitsInfo, trait2: TraitsInfo) {
 
       if (!compare(traitData.type_name, traitData2.type_name, true))
         return false;
-      // if (!compareTypeNames(traitData.type_name, traitData2.type_name))
-      // compare vindex here
 
       break;
     }
   }
 
-  if (!traitCache[trait.name]) traitCache[trait.name] = new Set();
-  traitCache[trait.name].add(trait2.name);
-
   return true;
 }
 
-async function compareQNames(
+function compareQNames(
   a: MultinameInfo,
   b: MultinameInfo,
   indexA: number,
@@ -182,7 +176,16 @@ async function compareQNames(
     const name = abc.constant_pool.string[qname.name - 1];
     const name2 = abc2.constant_pool.string[qname2.name - 1];
 
-    if (!compareNames(name, name2)) return false;
+    const isObfuscated = name.startsWith("_-");
+    const isObfuscated2 = name2.startsWith("_-");
+
+    if (isObfuscated !== isObfuscated2) {
+      return false;
+    }
+
+    if (!isObfuscated) {
+      return name === name2;
+    }
   }
 
   let data = findMultiname(true, indexA);
@@ -192,8 +195,6 @@ async function compareQNames(
 
   if (data.instance_traits.length !== data2.instance_traits.length)
     return false;
-
-  if (data.class.length !== data2.class.length) return false;
 
   if (data.class_traits.length !== data2.class_traits.length) return false;
 
@@ -211,36 +212,32 @@ async function compareQNames(
   )
     return false;
 
-  // const codeData = await findMultinameInCode(true, indexA);
-  // const codeData2 = await findMultinameInCode(false, indexB);
+  if (data.code_references.length !== data2.code_references.length)
+    return false;
 
-  // if (codeData.instance_traits.length !== codeData2.instance_traits.length)
-  //   return false;
-  // if (codeData.class_traits.length !== codeData2.class_traits.length)
-  //   return false;
+  if (
+    !data.code_references.every((body, i) => {
+      const body2 = data2.code_references[i];
 
-  // if (
-  //   !codeData.instance_traits.every((v, i) =>
-  //     compareTraits(v, codeData2.instance_traits[i])
-  //   )
-  // )
-  //   return false;
+      const method = abc.method[body.method];
+      const method2 = abc2.method[body2.method];
 
-  // if (
-  //   !codeData.class_traits.every((v, i) =>
-  //     compareTraits(v, codeData2.class_traits[i])
-  //   )
-  // )
-  //   return false;
+      if (method.flags !== method2.flags) return false;
+      if (method.param_count !== method2.param_count) return false;
+
+      return true;
+    })
+  )
+    return false;
 
   return true;
 }
 
-async function compare(
+function compare(
   iA: number,
   iB: number,
   roughComparison: boolean = false
-): Promise<boolean> {
+): boolean {
   const a = multinames[iA];
   const b = multinames2[iB];
 
@@ -251,33 +248,52 @@ async function compare(
   switch (a.kind) {
     case MultinameKind.QName:
     case MultinameKind.QNameA:
-      if (!(await compareQNames(a, b, iA, iB, roughComparison))) return false;
+      if (!compareQNames(a, b, iA, iB, roughComparison)) return false;
       break;
   }
   return true;
 }
 
 async function main() {
-  const changes = await diff(multinames, multinames2, compare);
+  const start = performance.now();
+
+  await buildXRef(abc, xrefCache);
+  await buildXRef(abc2, xrefCache2);
+
+  const changes = Array.from(calcPatch(multinames, multinames2, compare));
+
+  let insertions = 0;
+  let deletions = 0;
+
   for (const change of changes) {
-    if (change.operation === "delete") {
+    const insert: any = change[2];
+
+    if (!insert.length) {
+      deletions++;
       console.log(
-        `[${change.position_old.toString().padStart(6, "0")}]\x1b[31m - ${
-          abc.constant_pool.string[
-            (multinames[change.position_old].data as any).name - 1
-          ]
+        `[${change[0].toString().padStart(6, "0")}]\x1b[31m - ${
+          abc.constant_pool.string[(multinames[change[0]].data as any).name - 1]
         }\x1b[0m`
       );
     } else {
+      insertions++;
       console.log(
-        `[${change.position_old.toString().padStart(6, "0")}]\x1b[92m + ${
-          abc2.constant_pool.string[
-            (multinames2[change.position_new as number].data as any).name - 1
-          ]
+        `[${change[0].toString().padStart(6, "0")}]\x1b[92m + ${
+          abc2.constant_pool.string[insert[0].data.name - 1]
         }\x1b[0m`
       );
     }
   }
+
+  const end = performance.now();
+
+  console.log();
+  console.log(`Statistics:`);
+  console.log(`  Insertions: ${insertions}`);
+  console.log(`  Deletions: ${deletions}`);
+  console.log(`  Total: ${insertions + deletions}`);
+  console.log(`  Delta: ${insertions - deletions}`);
+  console.log(`  Total time: ${end - start}ms`);
 }
 
 main();
