@@ -152,8 +152,7 @@ function compareTraits(trait: TraitsInfo, trait2: TraitsInfo) {
 
       if (traitData.slot_id !== traitData2.slot_id) return false;
 
-      if (!compare(traitData.type_name, traitData2.type_name, true))
-        return false;
+      if (!compare(traitData.type_name, traitData2.type_name)) return false;
 
       break;
     }
@@ -293,7 +292,28 @@ async function main() {
   console.log(`  Deletions: ${deletions}`);
   console.log(`  Total: ${insertions + deletions}`);
   console.log(`  Delta: ${insertions - deletions}`);
+  console.log(
+    `  Multiname Difference: ${multinames2.length - multinames.length}`
+  );
   console.log(`  Total time: ${end - start}ms`);
 }
 
+async function test() {
+  await buildXRef(abc, xrefCache);
+  await buildXRef(abc2, xrefCache2);
+
+  let dupes = 0;
+  for (let i = 0; i < multinames.length; i++) {
+    let count = 0;
+    for (let j = 0; j < multinames2.length; j++) {
+      if (compare(i, j)) {
+        count++;
+      }
+    }
+    dupes += count > 1 ? 1 : 0;
+    console.log(dupes);
+  }
+}
+
 main();
+// test();
