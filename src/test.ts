@@ -102,7 +102,7 @@ function findMultiname(one: boolean, nameIndex: number): XRef {
   return (one ? xrefCache : xrefCache2)[nameIndex];
 }
 
-function compareTraits(trait: TraitsInfo, trait2: TraitsInfo) {
+function _compareTraits(trait: TraitsInfo, trait2: TraitsInfo): boolean {
   if (trait.kind !== trait2.kind) return false;
 
   switch (trait.kind & 0xf) {
@@ -159,6 +159,28 @@ function compareTraits(trait: TraitsInfo, trait2: TraitsInfo) {
   }
 
   return true;
+}
+
+const traitCache: {
+  [key: number]: {
+    [key: number]: boolean;
+  };
+} = {};
+function compareTraits(trait: TraitsInfo, trait2: TraitsInfo) {
+  if (!!traitCache[trait.name] && traitCache[trait.name][trait2.name] !== undefined) {
+    return traitCache[trait.name][trait2.name];
+  }
+
+  if (!!traitCache[trait2.name] && traitCache[trait2.name][trait.name] !== undefined) {
+    return traitCache[trait2.name][trait.name];
+  }
+
+  const result = _compareTraits(trait, trait2);
+
+  if (!traitCache[trait.name]) traitCache[trait.name] = {};
+  traitCache[trait.name][trait2.name] = result;
+
+  return result;
 }
 
 function compareQNames(
@@ -255,6 +277,7 @@ function compare(
 
 async function main() {
   const start = performance.now();
+  const originalMem = process.memoryUsage();
 
   await buildXRef(abc, xrefCache);
   await buildXRef(abc2, xrefCache2);
@@ -285,6 +308,7 @@ async function main() {
   }
 
   const end = performance.now();
+  const mem = process.memoryUsage();
 
   console.log();
   console.log(`Statistics:`);
@@ -295,7 +319,16 @@ async function main() {
   console.log(
     `  Multiname Difference: ${multinames2.length - multinames.length}`
   );
+
+  console.log();
+
+  console.log("Performance:");
   console.log(`  Total time: ${end - start}ms`);
+  console.log(
+    `  Memory: ${Math.round(
+      (mem.heapUsed - originalMem.heapUsed) / 1024 / 1024
+    )}MB`
+  );
 }
 
 async function test() {
