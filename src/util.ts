@@ -24,3 +24,8 @@ export function getUInt30Size(value: number) {
 
   return bytes;
 }
+
+export function round(value: number, decimals: number) {
+  const multiplier = Math.pow(10, decimals);
+  return Math.round(value * multiplier) / multiplier;
+}

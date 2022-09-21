@@ -14,8 +14,9 @@ import {
 import { readFileSync } from "fs";
 import { join } from "path";
 import { SWFFile } from "swf-parser";
-import { calcPatch } from "./myers";
-import { getABCFile } from "./util";
+import { ArrayChange, diffArrays } from "diff";
+
+import { getABCFile, round } from "./util";
 
 const assets = join(__dirname, "../assets");
 
@@ -51,14 +52,25 @@ type XRefCache = {
   [key: number]: XRef;
 };
 
-const xrefCache: XRefCache = [];
-const xrefCache2: XRefCache = [];
-async function buildXRef(file: AbcFile, cache: XRefCache) {
+type Cache = {
+  xrefs: XRefCache;
+  methodBodies: MethodBodyInfo[];
+};
+
+const abcCache: Cache = {
+  xrefs: {},
+  methodBodies: [],
+};
+const abcCache2: Cache = {
+  xrefs: {},
+  methodBodies: [],
+};
+async function buildXRef(file: AbcFile, cache: Cache) {
   const disass = new InstructionDisassembler(file);
 
   await Promise.all(
     file.constant_pool.multiname.map(async (v, i) => {
-      cache[i] = {
+      cache.xrefs[i] = {
         instances: [],
         instance_traits: [],
         class_traits: [],
@@ -70,18 +82,20 @@ async function buildXRef(file: AbcFile, cache: XRefCache) {
   await Promise.all([
     ...file.instance.map(async (v) => {
       const name = v.name;
-      cache[name - 1].instances.push(v);
+      cache.xrefs[name - 1].instances.push(v);
 
       v.trait.forEach((t) => {
-        cache[t.name - 1].instance_traits.push(t);
+        cache.xrefs[t.name - 1].instance_traits.push(t);
       });
     }),
     ...file.class.map(async (v) => {
       v.traits.forEach((t) => {
-        cache[t.name - 1].class_traits.push(t);
+        cache.xrefs[t.name - 1].class_traits.push(t);
       });
     }),
     ...file.method_body.map(async (v) => {
+      cache.methodBodies[v.method] = v;
+
       const instructions = disass.disassemble(v);
 
       instructions.forEach((instruction) => {
@@ -90,7 +104,7 @@ async function buildXRef(file: AbcFile, cache: XRefCache) {
           if (type === "multiname") {
             const rawIndex = instruction.rawParams[i];
 
-            cache[rawIndex - 1].code_references.push(v);
+            cache.xrefs[rawIndex - 1].code_references.push(v);
           }
         }
       });
@@ -99,7 +113,7 @@ async function buildXRef(file: AbcFile, cache: XRefCache) {
 }
 
 function findMultiname(one: boolean, nameIndex: number): XRef {
-  return (one ? xrefCache : xrefCache2)[nameIndex];
+  return (one ? abcCache : abcCache2).xrefs[nameIndex];
 }
 
 function _compareTraits(trait: TraitsInfo, trait2: TraitsInfo): boolean {
@@ -118,10 +132,8 @@ function _compareTraits(trait: TraitsInfo, trait2: TraitsInfo): boolean {
       if (method.name !== method2.name && (!method.name || !method2.name))
         return false;
 
-      const body = abc.method_body.find((v) => v.method == methodData.method);
-      const body2 = abc2.method_body.find(
-        (v) => v.method == methodData2.method
-      );
+      const body = abcCache.methodBodies[methodData.method];
+      const body2 = abcCache2.methodBodies[methodData2.method];
 
       if (!!body && !!body2) {
         if (body.max_stack !== body2.max_stack) return false;
@@ -167,11 +179,17 @@ const traitCache: {
   };
 } = {};
 function compareTraits(trait: TraitsInfo, trait2: TraitsInfo) {
-  if (!!traitCache[trait.name] && traitCache[trait.name][trait2.name] !== undefined) {
+  if (
+    !!traitCache[trait.name] &&
+    traitCache[trait.name][trait2.name] !== undefined
+  ) {
     return traitCache[trait.name][trait2.name];
   }
 
-  if (!!traitCache[trait2.name] && traitCache[trait2.name][trait.name] !== undefined) {
+  if (
+    !!traitCache[trait2.name] &&
+    traitCache[trait2.name][trait.name] !== undefined
+  ) {
     return traitCache[trait2.name][trait.name];
   }
 
@@ -275,40 +293,92 @@ function compare(
   return true;
 }
 
+function printChanges(
+  changes: ArrayChange<{
+    type: number;
+    index: number;
+  }>[]
+) {
+  let oI = 0;
+  let pending = 0;
+  for (const change of changes) {
+    if (change.removed) {
+      for (const data of change.value) {
+        console.log(
+          `[${oI.toString().padStart(6, "0")}]\x1b[31m - ${
+            abc.constant_pool.string[
+              (multinames[data.index].data as any).name - 1
+            ]
+          }\x1b[0m`
+        );
+      }
+    } else if (change.added) {
+      for (const data of change.value) {
+        console.log(
+          `[${oI.toString().padStart(6, "0")}]\x1b[92m + ${
+            abc2.constant_pool.string[
+              (multinames2[data.index].data as any).name - 1
+            ]
+          }\x1b[0m`
+        );
+      }
+
+      if (pending === change.count) {
+        console.log("DETECETD CHANGE");
+      }
+    }
+    if (!change.added && !change.removed) {
+      oI += (change.count || 0) + pending;
+      pending = 0;
+    } else if (change.removed) {
+      pending += change.count || 0;
+    }
+  }
+}
+
 async function main() {
   const start = performance.now();
   const originalMem = process.memoryUsage();
 
-  await buildXRef(abc, xrefCache);
-  await buildXRef(abc2, xrefCache2);
+  await buildXRef(abc, abcCache);
+  await buildXRef(abc2, abcCache2);
 
-  const changes = Array.from(calcPatch(multinames, multinames2, compare));
+  const cacheMemory = process.memoryUsage();
 
-  let insertions = 0;
-  let deletions = 0;
+  const changes = diffArrays(
+    multinames.map((_, i) => ({
+      type: 1,
+      index: i,
+    })),
+    multinames2.map((_, i) => ({
+      type: 2,
+      index: i,
+    })),
+    {
+      comparator: (left, right) => {
+        if (left.type === right.type) {
+          throw new Error("Cannot compare two objects of same type");
+        }
 
-  for (const change of changes) {
-    const insert: any = change[2];
+        const iA = left.type == 1 ? left.index : right.index;
+        const iB = left.type == 2 ? left.index : right.index;
 
-    if (!insert.length) {
-      deletions++;
-      console.log(
-        `[${change[0].toString().padStart(6, "0")}]\x1b[31m - ${
-          abc.constant_pool.string[(multinames[change[0]].data as any).name - 1]
-        }\x1b[0m`
-      );
-    } else {
-      insertions++;
-      console.log(
-        `[${change[0].toString().padStart(6, "0")}]\x1b[92m + ${
-          abc2.constant_pool.string[insert[0].data.name - 1]
-        }\x1b[0m`
-      );
+        return compare(iA, iB);
+      },
     }
-  }
+  );
 
   const end = performance.now();
   const mem = process.memoryUsage();
+
+  printChanges(changes);
+
+  const insertions = changes
+    .filter((v) => v.added)
+    .reduce((pv, v) => pv + (v.count || 0), 0);
+  const deletions = changes
+    .filter((v) => v.removed)
+    .reduce((pv, v) => pv + (v.count || 0), 0);
 
   console.log();
   console.log(`Statistics:`);
@@ -323,29 +393,26 @@ async function main() {
   console.log();
 
   console.log("Performance:");
-  console.log(`  Total time: ${end - start}ms`);
+  console.log(`  Total time: ${round(end - start, 2)}ms`);
   console.log(
-    `  Memory: ${Math.round(
-      (mem.heapUsed - originalMem.heapUsed) / 1024 / 1024
+    `  Cache Memory: ${round(
+      (cacheMemory.heapUsed - originalMem.heapUsed) / 1024 / 1024,
+      2
     )}MB`
   );
+  console.log(
+    `  Comparison Cache Memory: ${round(
+      (mem.heapUsed - cacheMemory.heapUsed) / 1024 / 1024,
+      2
+    )}MB`
+  );
+  console.log(`  Total Memory: ${round(mem.heapUsed / 1024 / 1024, 2)}MB`);
 }
 
 async function test() {
-  await buildXRef(abc, xrefCache);
-  await buildXRef(abc2, xrefCache2);
-
-  let dupes = 0;
-  for (let i = 0; i < multinames.length; i++) {
-    let count = 0;
-    for (let j = 0; j < multinames2.length; j++) {
-      if (compare(i, j)) {
-        count++;
-      }
-    }
-    dupes += count > 1 ? 1 : 0;
-    console.log(dupes);
-  }
+  await buildXRef(abc, abcCache);
+  await buildXRef(abc2, abcCache2);
+  console.log(compare(269, 268));
 }
 
 main();
