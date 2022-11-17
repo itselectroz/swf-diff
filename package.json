@@ -1,12 +1,12 @@
 {
   "name": "swf-diff",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "test": "npm run build && node dist/test.js",
-    "postinstall": "npm run build"
+    "prepublish": "npm run build"
   },
   "repository": {
     "type": "git",
