@@ -9,11 +9,12 @@ import { getABCFile, round } from "./util";
 
 const assets = join(__dirname, "../assets");
 
-const patch0608 = join(assets, "BrawlhallaAir.0608.swf");
-const patch0608hotfix = join(assets, "BrawlhallaAir.0608.hotfix.swf");
+const june = join(assets, "BrawlhallaAir - techtest - 2023-06-14.swf");
+const july = join(assets, "BrawlhallaAir - techtest - 2023-07-12.swf");
+const august = join(assets, "BrawlhallaAir - techtest - 2023-08-09.swf");
 
-const rawSWF = readFileSync(patch0608);
-const rawSWF2 = readFileSync(patch0608hotfix);
+const rawSWF = readFileSync(june);
+const rawSWF2 = readFileSync(august);
 
 const swf = SWFFile.load(rawSWF);
 const swf2 = SWFFile.load(rawSWF2);
@@ -101,7 +102,7 @@ async function main() {
   console.log(`  Total: ${insertions + deletions}`);
   console.log(`  Delta: ${insertions - deletions}`);
   console.log(
-    `  Multiname Difference: ${multinames2.length - multinames.length}`
+    `  Multiname Difference: ${multinames2.length - multinames.length} (${multinames2.length} - ${multinames.length}})`
   );
 
   console.log();
@@ -131,15 +132,8 @@ async function test() {
 
   const mappings = comparator.generateSymbolMapping(changes);
 
-  let ohFuck = [];
+  let ohFuck = multinames.map((_, i) => i).filter((i) => mappings[i] === undefined)
 
-  for (let i = 0; i < multinames.length; i++) {
-    if (mappings[i] == undefined) {
-      ohFuck.push(i);
-    }
-  }
-
-  console.log(ohFuck);
   console.log(`Failed to map ${ohFuck.length} symbols`);
 
   comparator.setSymbolMapping(mappings);

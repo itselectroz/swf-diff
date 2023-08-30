@@ -6,6 +6,7 @@ import {
   MultinameInfo,
   MultinameKind,
   MultinameKindQName,
+  TraitClass,
   TraitMethod,
   TraitsInfo,
   TraitSlot,
@@ -27,6 +28,8 @@ export type XRefCache = {
 export type Cache = {
   xrefs: XRefCache;
   methodBodies: MethodBodyInfo[];
+  methodNames: number[];
+  scriptNames: number[];
 };
 
 export type GenericComparisonCache = {
@@ -73,11 +76,15 @@ export class Comparator {
     this.abcCache = {
       xrefs: {},
       methodBodies: [],
+      methodNames: [],
+      scriptNames: [],
     };
 
     this.abcCache2 = {
       xrefs: {},
       methodBodies: [],
+      methodNames: [],
+      scriptNames: [],
     };
 
     this.traitCache = {};
@@ -102,14 +109,34 @@ export class Comparator {
         const name = v.name;
         cache.xrefs[name - 1].instances.push(v);
 
+        cache.methodNames[v.iinit - 1] = v.name - 1;
+
         v.trait.forEach((t) => {
-          cache.xrefs[t.name - 1].instance_traits.push(t);
+          if ((t.kind & 0xf) == TraitTypes.Method) {
+            const methodData = t.data as TraitMethod;
+            cache.methodNames[methodData.method] = t.name - 1;
+          }
+          if (!cache.xrefs[t.name - 1].instance_traits.find(tt => tt.name == t.name))
+            cache.xrefs[t.name - 1].instance_traits.push(t);
+          cache.xrefs[t.name - 1].instances.push(v);
         });
       }),
-      ...file.class.map(async (v) => {
+      ...file.class.map(async (v, i) => {
         v.traits.forEach((t) => {
-          cache.xrefs[t.name - 1].class_traits.push(t);
+          if ((t.kind & 0xf) == TraitTypes.Method) {
+            const methodData = t.data as TraitMethod;
+            cache.methodNames[methodData.method] = t.name - 1;
+          }
+          if (!cache.xrefs[t.name - 1].class_traits.find(v => v.name == t.name))
+            cache.xrefs[t.name - 1].class_traits.push(t);
         });
+      }),
+      ...file.script.map(async (v) => {
+        const trait = v.trait[0];
+        if (trait === undefined) return;
+        if ((trait.kind & 0xF) !== TraitTypes.Class) return;
+
+        cache.scriptNames[v.init - 1] = trait.name;
       }),
       ...file.method_body.map(async (v) => {
         cache.methodBodies[v.method] = v;
@@ -122,7 +149,8 @@ export class Comparator {
             if (type === "multiname") {
               const rawIndex = instruction.rawParams[i];
 
-              cache.xrefs[rawIndex - 1].code_references.push(v);
+              if (!cache.xrefs[rawIndex - 1].code_references.includes(v))
+                cache.xrefs[rawIndex - 1].code_references.push(v);
             }
           }
         });
@@ -134,11 +162,15 @@ export class Comparator {
     this.abcCache = {
       xrefs: {},
       methodBodies: [],
+      methodNames: [],
+      scriptNames: [],
     };
 
     this.abcCache2 = {
       xrefs: {},
       methodBodies: [],
+      methodNames: [],
+      scriptNames: [],
     };
 
     await Promise.all([
@@ -347,6 +379,215 @@ export class Comparator {
     );
   }
 
+  private getMethodBodyForMapSymbols(method_body: MethodBodyInfo, mapping: { [key: number]: number }) {
+    let name = this.abcCache.methodNames[method_body.method];
+
+    if (name !== undefined) {
+      const name2 = mapping[name];
+
+      if (name2 === undefined) return;
+
+      const methodIndex2 = this.abcCache2.methodNames.findIndex(v => v === name2);
+
+      if (methodIndex2 === -1) return;
+
+      return this.abcCache2.methodBodies[methodIndex2];
+    } else {
+      name = this.abcCache.scriptNames[method_body.method];
+
+      if (name === undefined) return;
+
+      const name2 = mapping[name];
+      if (name2 === undefined) return;
+
+      const methodIndex2 = this.abcCache2.scriptNames.findIndex(v => v === name2);
+      if (methodIndex2 === -1) return;
+
+      return this.abcCache2.methodBodies[methodIndex2];
+    }
+  }
+
+  private mapSymbolsThroughCode(unmapped: number[], mapping: { [key: number]: number }) {
+    for (const unmappedIndex of unmapped) {
+      if (mapping[unmappedIndex] !== undefined) continue;
+
+      const xrefs = this.abcCache.xrefs[unmappedIndex];
+      for (const method_body of xrefs.code_references) {
+        const method_body2 = this.getMethodBodyForMapSymbols(method_body, mapping);
+
+        if (method_body2 === undefined) continue;
+
+        const instructions = this.disassembler.disassemble(method_body);
+        const instructions2 = this.disassembler2.disassemble(method_body2);
+
+        // Loop instructions and find all unique unmapped symbols
+
+        if (instructions.length > 1000) continue
+
+        const changes = diffArrays(
+          instructions,
+          instructions2,
+          {
+            comparator: (left, right) => {
+              if (left.id !== right.id) return false;
+
+              for (let i = 0; i < left.types.length; i++) {
+                const type = left.types[i];
+
+                switch (type) {
+                  case "string":
+                  case "double":
+                  case "u8":
+                  case "u30":
+                    if (left.params[i] !== right.params[i]) return false;
+                }
+              }
+
+              return true;
+            },
+          }
+        );
+
+        let offset = 0;
+        let offset2 = 0;
+        for (const change of changes) {
+          if (change.added) {
+            offset2 += change.count as number;
+            continue;
+          }
+          if (change.removed) {
+            offset += change.count as number;
+            continue;
+          }
+
+          // loop count
+          const count = change.count || 0;
+
+          for (let i = 0; i < count; i++) {
+            const instruction = instructions[offset + i];
+            const instruction2 = instructions2[offset2 + i];
+
+            for (let j = 0; j < instruction.types.length; j++) {
+              if (instruction.types[j] !== "multiname") continue;
+
+              const nameA = instruction.rawParams[j] - 1;
+              const nameB = instruction2.rawParams[j] - 1;
+
+              if (mapping[nameA] !== undefined) continue;
+
+              // console.log(`Mapping ${nameA} to ${nameB}`)
+
+              mapping[nameA] = nameB;
+            }
+          }
+
+          offset += count;
+          offset2 += count;
+        }
+      }
+    }
+  }
+
+  private mapSymbolsThroughCodeTwo(unmapped: number[], mapping: { [key: number]: number }) {
+    for (const unmappedIndex of unmapped) {
+      if (mapping[unmappedIndex] !== undefined) continue;
+
+      const xrefs = this.abcCache.xrefs[unmappedIndex];
+      for (const method_body of xrefs.code_references) {
+
+        // const method_body2 = this.getMethodBodyForMapSymbols(method_body, mapping);
+
+        let name = this.abcCache.methodNames[method_body.method];
+        const name2 = mapping[name];
+
+        if (name2 === undefined) continue;
+
+        const methodIndex2 = this.abcCache2.methodNames.findIndex((v, i) => {
+          if (v !== name2) return false;
+
+          const method_body2 = this.abcCache2.methodBodies[i];
+
+          const instrDifference = Math.abs(method_body2.code.length - method_body.code.length);
+
+          return (instrDifference / method_body.code.length) < 0.1;
+        });
+
+        if (methodIndex2 === -1) continue;
+
+        const method_body2 = this.abcCache2.methodBodies[methodIndex2];
+
+        if (method_body2 === undefined) continue;
+
+        const instructions = this.disassembler.disassemble(method_body);
+        const instructions2 = this.disassembler2.disassemble(method_body2);
+
+        // Loop instructions and find all unique unmapped symbols
+
+        const changes = diffArrays(
+          instructions,
+          instructions2,
+          {
+            comparator: (left, right) => {
+              if (left.id !== right.id) return false;
+
+              for (let i = 0; i < left.types.length; i++) {
+                const type = left.types[i];
+
+                switch (type) {
+                  case "string":
+                  case "double":
+                  case "u8":
+                  case "u30":
+                    if (left.params[i] !== right.params[i]) return false;
+                }
+              }
+
+              return true;
+            },
+          }
+        );
+
+        let offset = 0;
+        let offset2 = 0;
+        // console.log(changes);
+        for (const change of changes) {
+          if (change.added) {
+            offset2 += change.count as number;
+            continue;
+          }
+          if (change.removed) {
+            offset += change.count as number;
+            continue;
+          }
+
+          // loop count
+          const count = change.count || 0;
+
+          for (let i = 0; i < count; i++) {
+            const instruction = instructions[offset + i];
+            const instruction2 = instructions2[offset2 + i];
+
+            for (let j = 0; j < instruction.types.length; j++) {
+              if (instruction.types[j] !== "multiname") continue;
+
+              const nameA = instruction.rawParams[j] - 1;
+              const nameB = instruction2.rawParams[j] - 1;
+
+              if (mapping[nameA] !== undefined) continue;
+
+              // console.log(`Mapping ${nameA} to ${nameB}`)
+
+              mapping[nameA] = nameB;
+            }
+          }
+
+          offset += count;
+          offset2 += count;
+        }
+      }
+    }
+  }
+
   generateSymbolMapping(changes?: Change[]): SymbolMapping {
     changes = !!changes ? changes : this.diff();
 
@@ -367,6 +608,17 @@ export class Comparator {
           }
         }
       }
+    }
+
+    let unmapped = this.multinames.map((_, i) => i).filter((i) => mapping[i] === undefined);
+    if (unmapped.length > 0) {
+      this.mapSymbolsThroughCode(unmapped, mapping);
+
+      unmapped = this.multinames.map((_, i) => i).filter((i) => mapping[i] === undefined);
+      this.mapSymbolsThroughCodeTwo(unmapped, mapping);
+
+      unmapped = this.multinames.map((_, i) => i).filter((i) => mapping[i] === undefined);
+      this.mapSymbolsThroughCodeTwo(unmapped, mapping);
     }
 
     return mapping;
@@ -433,11 +685,15 @@ export class Comparator {
     this.abcCache = {
       xrefs: {},
       methodBodies: [],
+      methodNames: [],
+      scriptNames: [],
     };
 
     this.abcCache2 = {
       xrefs: {},
       methodBodies: [],
+      methodNames: [],
+      scriptNames: [],
     };
 
     this.traitCache = {};
